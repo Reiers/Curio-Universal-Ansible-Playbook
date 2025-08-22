@@ -1,0 +1,170 @@
+---
+- name: Build & deploy Curio from Git (universal)
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    # --- Repo & paths ---
+    curio_repo: "https://github.com/filecoin-project/curio.git"
+    curio_branch: "main"
+    # Where to put the source checkout (override with -e curio_path=/path)
+    curio_path: "{{ curio_path | default('/opt/curio') }}"
+    # User that owns the source tree and does the build (override with -e build_user=<user>)
+    build_user: "{{ build_user | default(ansible_user | default(ansible_ssh_user | default('root'))) }}"
+    # Name of the systemd unit (override with -e curio_service_name=curio-worker.service etc.)
+    curio_service_name: "{{ curio_service_name | default('curio.service') }}"
+
+    # --- Build options ---
+    # Typical targets: 'build' (mainnet), 'build-calibnet', etc. Check Makefile for available targets.
+    build_target: "{{ build_target | default('build') }}"
+    # Enable CUDA seal (set to false if you build for CPU-only hosts)
+    use_cuda: "{{ use_cuda | default(true) }}"
+    build_env:
+      RUSTFLAGS: "-C target-cpu=native -g"
+      FFI_BUILD_FROM_SOURCE: "1"
+      FFI_USE_CUDA_SUPRASEAL: "{{ '1' if use_cuda | bool else omit }}"
+
+    # --- OS packages (you can add/remove as your environment needs) ---
+    common_packages_debian:
+      - git
+      - build-essential
+      - pkg-config
+      - clang
+      - llvm
+      - libclang-dev
+      - libssl-dev
+      - cmake
+      - hwloc
+      - curl
+    common_packages_redhat:
+      - git
+      - gcc
+      - gcc-c++
+      - make
+      - pkgconfig
+      - clang
+      - llvm
+      - clang-devel
+      - openssl-devel
+      - cmake
+      - hwloc
+      - curl
+
+  pre_tasks:
+    - name: Ensure build deps (Debian/Ubuntu)
+      apt:
+        name: "{{ common_packages_debian }}"
+        state: present
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+      tags: [deps]
+
+    - name: Ensure build deps (RHEL/CentOS/Fedora)
+      yum:
+        name: "{{ common_packages_redhat }}"
+        state: present
+      when: ansible_os_family == "RedHat"
+      tags: [deps]
+
+    - name: Ensure checkout directory exists and is owned by build_user
+      file:
+        path: "{{ curio_path }}"
+        state: directory
+        owner: "{{ build_user }}"
+        group: "{{ build_user }}"
+        mode: '0755'
+
+  tasks:
+    - name: Checkout/update Curio ({{ curio_branch }})
+      git:
+        repo: "{{ curio_repo }}"
+        dest: "{{ curio_path }}"
+        version: "{{ curio_branch }}"
+        update: yes
+        force: no
+        accept_newhostkey: yes
+      become_user: "{{ build_user }}"
+      tags: [code]
+
+    - name: Ensure Rust toolchain for {{ build_user }}
+      shell: |
+        set -euo pipefail
+        if ! command -v cargo >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        fi
+        test -f "$HOME/.cargo/env" && . "$HOME/.cargo/env"
+        rustc --version && cargo --version
+      args:
+        executable: /bin/bash
+        chdir: "{{ curio_path }}"
+      become_user: "{{ build_user }}"
+      register: cargo_version
+      changed_when: false
+      tags: [deps]
+
+    - name: Build Curio ({{ build_target }})
+      shell: |
+        set -euo pipefail
+        . "$HOME/.cargo/env"
+        make clean {{ build_target }}
+      args:
+        executable: /bin/bash
+        chdir: "{{ curio_path }}"
+      become_user: "{{ build_user }}"
+      environment: "{{ build_env }}"
+      register: build_result
+      tags: [build]
+
+    - name: Stop {{ curio_service_name }} if running
+      systemd:
+        name: "{{ curio_service_name }}"
+        state: stopped
+      failed_when: false
+      tags: [deploy]
+
+    - name: Install Curio (make install as root)
+      shell: |
+        set -euo pipefail
+        make install
+      args:
+        executable: /bin/bash
+        chdir: "{{ curio_path }}"
+      # Run as root so it can write to /usr/local/bin, etc.
+      register: install_result
+      tags: [deploy]
+
+    - name: Check if unit file exists
+      stat:
+        path: "/etc/systemd/system/{{ curio_service_name }}"
+      register: curio_unit
+
+    - name: Reload systemd if needed
+      systemd:
+        daemon_reload: yes
+      when: curio_unit.stat.exists
+      tags: [deploy]
+
+    - name: Enable & start {{ curio_service_name }}
+      systemd:
+        name: "{{ curio_service_name }}"
+        enabled: yes
+        state: started
+      when: curio_unit.stat.exists
+      register: curio_service
+      tags: [deploy]
+
+    - name: Verify Curio version
+      command: curio --version
+      register: curio_ver
+      changed_when: false
+
+    - name: Summary
+      debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Built as {{ build_user }}; toolchain: {{ cargo_version.stdout | default('n/a') }}"
+          - "Service: {{ curio_service_name }} ({{ curio_service.status.ActiveState | default('n/a') }})"
+          - "Curio version: {{ curio_ver.stdout | default('unknown') }}"
+
